@@ -1,19 +1,81 @@
-[package]
-name = "realtime-translation"
+[workspace]
+resolver = "3"
+members = [
+    "crates/audio-os",
+    "crates/pipeline",
+    "crates/ui",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# OS / audio
+pipewire = { version = "0.9.2", features = ["v0_3_77"] }
+libspa   = "0.9"
+
+# Async + net
+tokio              = { version = "1", features = ["full"] }
+tokio-tungstenite  = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures            = "0.3"
+futures-util       = "0.3"
+
+# Audio plumbing
+ringbuf  = "0.4"
+rubato   = "0.16"
+hound    = "3.5"
+
+# Misc
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+dotenvy     = "0.15"
+anyhow      = "1"
+thiserror   = "2"
+log         = "0.4"
+env_logger  = "0.11"
+bytes       = "1"
+
+# UI
+egui   = "0.32"
+eframe = "0.32"
+
+# Internal crates
+audio-os = { path = "crates/audio-os" }
+pipeline = { path = "crates/pipeline" }
+ui       = { path = "crates/ui" }
+
+# ---------------------------------------------------------------------
+# Root binary crate — the user-facing app + all dev binaries.
+# Workspace members live in crates/ ; this crate ties them together.
+# ---------------------------------------------------------------------
+
+[package]
+name = "realtime-translation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-anyhow = "1"
-serde_json = "1"
-bytes = "1"
-env_logger = "0.11"
-futures = "0.3"
-futures-util = "0.3"
-libc = "0.2"
-log = "0.4"
-nix = { version = "0.30", features = ["socket", "uio"] }
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-tokio-util = { version = "0.7", features = ["codec"] }
+audio-os    = { workspace = true }
+pipewire    = { workspace = true }
+anyhow      = { workspace = true }
+log         = { workspace = true }
+env_logger  = { workspace = true }
+tokio       = { workspace = true }
+dotenvy     = { workspace = true }
+
+[[bin]]
+name = "translator"
+path = "src/main.rs"
+
+[[bin]]
+name = "pw-smoke"
+path = "src/bin/pw-smoke.rs"
+
+[[bin]]
+name = "pw-list-nodes"
+path = "src/bin/pw-list-nodes.rs"
