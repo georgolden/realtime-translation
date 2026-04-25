@@ -24,9 +24,10 @@ futures            = "0.3"
 futures-util       = "0.3"
 
 # Audio plumbing
-ringbuf  = "0.4"
-rubato   = "0.16"
-hound    = "3.5"
+ringbuf   = "0.4"
+rubato    = "0.16"
+hound     = "3.5"
+bytemuck  = "1"
 
 # Misc
 serde       = { version = "1", features = ["derive"] }
@@ -67,6 +68,7 @@ log         = { workspace = true }
 env_logger  = { workspace = true }
 tokio       = { workspace = true }
 dotenvy     = { workspace = true }
+hound       = { workspace = true }
 
 [[bin]]
 name = "translator"
@@ -79,3 +81,7 @@ path = "src/bin/pw-smoke.rs"
 [[bin]]
 name = "pw-list-nodes"
 path = "src/bin/pw-list-nodes.rs"
+
+[[bin]]
+name = "pw-capture-wav"
+path = "src/bin/pw-capture-wav.rs"

@@ -1,11 +1,12 @@
 //! audio-os — PipeWire integration layer.
 //!
-//! Stage 1: enumeration only. `list_nodes()` connects to the PipeWire daemon,
-//! does one synchronous round-trip, and returns the snapshot of audio-related
-//! nodes (sources, sinks, monitors).
+//! Stage 1: enumeration (`list_nodes`).
+//! Stage 2: capture (`capture_for_duration`).
 
+mod capture;
 mod nodes;
 
+pub use capture::{capture_for_duration, AudioFormat, CaptureTarget};
 pub use nodes::{list_nodes, MediaClass, NodeInfo};
 
 use thiserror::Error;
@@ -14,4 +15,8 @@ use thiserror::Error;
 pub enum AudioOsError {
     #[error("pipewire error: {0}")]
     Pipewire(#[from] pipewire::Error),
+    #[error("failed to build EnumFormat param")]
+    FormatBuild,
+    #[error("failed to arm capture stop timer")]
+    TimerArm,
 }
