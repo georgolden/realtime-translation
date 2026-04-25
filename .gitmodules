@@ -1,0 +1,6 @@
+[submodule "vendor/pipewire"]
+	path = vendor/pipewire
+	url = git@github.com:PipeWire/pipewire.git
+[submodule "vendor/pipewire-rs"]
+	path = vendor/pipewire-rs
+	url = https://gitlab.freedesktop.org/pipewire/pipewire-rs.git
