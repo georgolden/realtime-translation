@@ -5,3 +5,21 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tokio              = { workspace = true }
+tokio-tungstenite  = { workspace = true }
+futures-util       = { workspace = true }
+rubato             = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+log                = { workspace = true }
+bytes              = { workspace = true }
+# Pulled in transitively via tokio-tungstenite; we depend on it
+# directly so we can install the `ring` crypto provider exactly once
+# at startup. Without this, the rustls 0.23 inside tungstenite panics
+# the moment it tries to negotiate TLS.
+rustls             = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+env_logger = { workspace = true }

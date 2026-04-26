@@ -440,11 +440,161 @@ even if Part 4 doesn't work perfectly.
 
 ---
 
+## Stage 4 — `pipeline-stt-stdin`
+
+**Purpose:** prove that the Deepgram WS client streams PCM in correctly,
+the result-message parser handles partials/finals/UtteranceEnd, and the
+transcript buffer (DESIGN §4.4) flushes at sentence boundaries instead of
+fragmenting on every Deepgram final.
+
+This stage has no integration with the OS beyond capture (already proved
+in Stage 2). What's new and worth verifying by ear is the **buffer
+heuristic**: a long sentence with mid-utterance pauses should land as
+**one** `FLUSHED` line, not a torrent of them.
+
+### Setup
+
+You need a Deepgram API key. Put it in `.env` at the project root:
+
+```
+DEEPGRAM_API_KEY=...
+```
+
+`.env` is git-ignored. The binary loads it via `dotenvy::dotenv()`.
+
+### Language detection
+
+By default the binary uses `language=multi`, which is nova-3's
+multilingual mode — it auto-detects the language within the stream
+and can handle mid-conversation language switches. This is the correct
+streaming equivalent of language detection. (Deepgram's
+`detect_language=true` param only works for pre-recorded audio, not
+streaming, and causes a 400 Bad Request on a WebSocket connection.)
+
+Pass `--language de` (or any BCP-47 code) to fix the language and
+skip detection. There is no `--detect-language` flag; `multi` is the
+default.
+
+```
+# Auto-detect / multilingual (default):
+cargo run --bin pipeline-stt-stdin -- --wav /tmp/utt.wav
+
+# Fixed language, no detection:
+cargo run --bin pipeline-stt-stdin -- --wav /tmp/utt.wav --language de
+```
+
+### Test 1 — wav file replay (stable, no PipeWire)
+
+Use a wav recorded via Stage 2's `pw-capture-wav`. The binary paces it
+at real-time so Deepgram's endpointing fires the same way it would on a
+live mic.
+
+```
+# Record a 10-second clip of yourself speaking 2–3 sentences with
+# clear pauses between them. Speak naturally — don't rush.
+cargo run --bin pw-capture-wav -- /tmp/utt.wav --secs 10
+
+# Replay through Deepgram (auto-detect language):
+cargo run --bin pipeline-stt-stdin -- --wav /tmp/utt.wav
+
+# Or with a fixed language:
+cargo run --bin pipeline-stt-stdin -- --wav /tmp/utt.wav --language de
+```
+
+**Expected output shape (timestamps in ms from start of run):**
+
+```
+[INFO ...] Deepgram model=nova-3 language=en; buffer punct>=30 max>=240 silence=1500ms
+[INFO ...] Deepgram: connecting to wss://api.deepgram.com/v1/listen
+[INFO ...] Deepgram: connected
+[INFO ...] wav: 48000 Hz, 1 ch, 32 bits, ...
+[   850 ms] PARTIAL    hello
+[  1100 ms] PARTIAL    hello there
+[  1350 ms] FINALISED  hello there friend.
+[  1360 ms] FLUSHED    (punctuation)  hello there friend.
+[  3200 ms] PARTIAL    so what
+[  3450 ms] PARTIAL    so what i wanted to say
+[  4100 ms] FINALISED  so what i wanted to say is the buffer should hold this together.
+[  4110 ms] FLUSHED    (punctuation)  so what i wanted to say is the buffer should hold this together.
+[INFO ...] wav: streaming complete
+[INFO ...] Deepgram: ws closed
+```
+
+**What to check:**
+
+1. `PARTIAL` lines arrive *during* speech — Deepgram reports interim
+   transcripts well before you finish a sentence.
+2. `FINALISED` is logged when Deepgram marks `is_final=true`, **before**
+   the buffer's flush trigger fires.
+3. `FLUSHED` lines correspond to natural sentence boundaries, not every
+   tiny chunk Deepgram finalised. The reason in parens tells you which
+   trigger fired:
+   - `punctuation` — buffer ended in `.`/`?`/`!`/`…` and ≥30 chars.
+   - `max-chars`   — runaway sentence hit 240 chars.
+   - `silence`     — ≥1.5 s of no new word (mid-thought pause).
+   - `utterance-end` — Deepgram's hard end-of-speech.
+   - `manual`      — only fires from a hotkey (no UI yet).
+4. The trailing `manual` flush at EOF ensures words near the end of the
+   file aren't silently dropped.
+
+### Test 2 — live mic
+
+Same path but with PipeWire capture instead of a wav file. Useful as a
+realistic feel-test before tuning the buffer constants.
+
+```
+# Auto-detect language (default):
+cargo run --bin pipeline-stt-stdin -- --mic --secs 30
+
+# Fixed language:
+cargo run --bin pipeline-stt-stdin -- --mic --secs 30 --language de
+```
+
+Speak naturally for the duration. Try both:
+- A single fluent sentence (expect one `FLUSHED (punctuation)`).
+- A halting sentence with a 2-second mid-pause (expect either an
+  `UtteranceEnd` flush split on the pause, or a `silence` flush — both
+  are valid behaviour, depending on which trigger fires first).
+
+If the resampler logs a build line:
+```
+[INFO  pipeline_stt_stdin] mic: building resampler for 48000 Hz × 1 ch
+```
+that confirms the negotiated format. PipeWire usually serves 48 kHz; the
+resampler downsamples to the 16 kHz Deepgram wants.
+
+### Tuning the buffer
+
+The defaults in `TranscriptBufferConfig` are starting points (see
+DESIGN §4.4). When you observe behaviour you don't like during real
+use:
+
+| Symptom | What to change |
+|---|---|
+| Sentences split mid-thought when you pause to think | Raise `silence_flush_ms` (default 1500). |
+| Sentences run on for too long before flushing | Lower `max_chars_before_flush` (default 240) or `silence_flush_ms`. |
+| Short replies like "yes." flush as a fragment | Raise `min_chars_for_punct_flush` (default 30) — though this is rarely the problem; the silence flush handles it. |
+
+These will be config-driven from `~/.config/realtime-translation/config.toml`
+once the app is wired up at Stage 8. For Stage 4 they're hard-coded
+defaults; edit them in `crates/pipeline/src/transcript.rs`.
+
+### Common issues at Stage 4
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `DEEPGRAM_API_KEY not set` | Missing or unreadable `.env` | Confirm the file exists at the project root and contains `DEEPGRAM_API_KEY=...`. |
+| `ws error: HTTP error: 401` | Invalid API key | Generate a new key at https://console.deepgram.com. |
+| All `PARTIAL` and zero `FINALISED` | The buffer never sees `is_final=true` — typically because the audio is silence or pure tones (Deepgram won't finalise empty transcripts) | Speak louder / closer; verify with `pw-capture-wav` that the file has signal. |
+| `FLUSHED (punctuation)` fires too eagerly on every short utterance | `min_chars_for_punct_flush` too low | Raise the threshold (default 30 should be fine for most speech). |
+| No flush at end of `--wav` run | Bug — should always trail with a manual flush on EOF | Check `pipeline-stt-stdin` log for `wav: streaming complete` followed by `Deepgram: ws closed`; the manual flush is appended in the WS task. |
+
+---
+
 ## What's not yet tested (because it doesn't exist yet)
 
 | Stage | Binary | What it'll do |
 |---|---|---|
-| 4 | `pipeline-stt-stdin` | Stream a wav into Deepgram; print transcripts |
 | 5 | (extends Stage 4) | Add DeepL output to the same binary |
 | 6 | (extends Stage 4 + audio-os virtmic) | Full Track 1, real meeting test |
 | 7 | (no new binary) | Track 2 prints translated subtitles to stdout |

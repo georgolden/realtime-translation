@@ -62,6 +62,7 @@ license.workspace = true
 
 [dependencies]
 audio-os    = { workspace = true }
+pipeline    = { workspace = true }
 pipewire    = { workspace = true }
 anyhow      = { workspace = true }
 log         = { workspace = true }
@@ -89,3 +90,7 @@ path = "src/bin/pw-capture-wav.rs"
 [[bin]]
 name = "pw-virtmic-tone"
 path = "src/bin/pw-virtmic-tone.rs"
+
+[[bin]]
+name = "pipeline-stt-stdin"
+path = "src/bin/pipeline-stt-stdin.rs"
