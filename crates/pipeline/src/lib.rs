@@ -10,12 +10,14 @@
 
 mod deepgram;
 mod deepl;
+mod elevenlabs;
 mod events;
 mod resample;
 mod transcript;
 
 pub use deepgram::{DeepgramClient, DeepgramConfig, DeepgramHandle};
 pub use deepl::{DeepLClient, DeepLConfig, TranslationContext};
+pub use elevenlabs::{elevenlabs_spawn, ElevenLabsConfig};
 pub use events::{PipelineEvent, TrackId};
 pub use resample::{resample_to_deepgram, ResampleState};
 pub use transcript::{FlushReason, TranscriptBuffer, TranscriptBufferConfig};

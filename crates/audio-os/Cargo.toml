@@ -10,6 +10,7 @@ libspa      = { workspace = true }
 log         = { workspace = true }
 thiserror   = { workspace = true }
 bytemuck    = { workspace = true }
+ringbuf     = { workspace = true }
 
 [dev-dependencies]
 env_logger  = { workspace = true }

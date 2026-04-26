@@ -705,12 +705,125 @@ billed. Tune via `--context N`:
 
 ---
 
+---
+
+## Stage 6 — ElevenLabs TTS playback
+
+**Purpose:** wire ElevenLabs streaming TTS into the same `pipeline-stt-stdin`
+binary so that every translation is spoken aloud via your cloned voice.
+Audio is routed to a PipeWire sink — the system default for testing, or
+`translator_virtmic_sink` to feed a meeting client.
+
+Stage 6 activates automatically when both `ELEVENLABS_API_KEY` and `VOICE_ID`
+are present in `.env` alongside `DEEPGRAM_API_KEY` and `DEEPL_API_KEY`.
+
+### Setup
+
+Add to `.env`:
+
+```
+ELEVENLABS_API_KEY=...
+VOICE_ID=...
+```
+
+`VOICE_ID` is the ID of your Instant Voice Clone from the ElevenLabs
+dashboard (Voices → your clone → copy ID).
+
+### Test 1 — wav replay, full chain
+
+```
+# Replay your German test recording — should hear EN translation spoken back:
+cargo run --bin pipeline-stt-stdin -- --wav /tmp/utt.wav --target-lang EN
+```
+
+**Expected log/output:**
+
+```
+[INFO ...] Deepgram model=nova-3 language=auto-detect (multi); ...
+[INFO ...] DeepL auto → EN (latency_optimized); context=5 sentences
+[INFO ...] ElevenLabs model=eleven_flash_v2_5 format=pcm_44100 → playback 44100Hz
+[INFO ...] ElevenLabs: connected
+[  6173 ms] FLUSHED    (punctuation)  Abends nach der Arbeit ...
+[  6350 ms] TRANSLATED [→ EN]  In the evenings after work, I often meet up with friends.
+[INFO ...] tts playback negotiated: rate=44100 channels=1
+            ← you hear the translation spoken in your cloned voice here
+```
+
+**What to check:**
+
+1. You hear audio from your default sink within ~300–500ms of `TRANSLATED`
+   appearing (Deepgram → DeepL → ElevenLabs TTFB).
+2. The voice sounds like your clone — if it sounds like a generic EL voice,
+   double-check `VOICE_ID` is the correct clone ID.
+3. Multiple sentences play sequentially without gaps — the ring buffer
+   and the `flush:true` signal per utterance ensure EL generates audio
+   immediately after each translation.
+
+### Test 2 — live mic, full chain
+
+```
+cargo run --bin pipeline-stt-stdin -- --mic --secs 60 --target-lang DE
+```
+
+Speak naturally in your source language. After each sentence pause you should
+hear the translation spoken back within roughly 600–1000ms (endpointing +
+DeepL + ElevenLabs TTFB).
+
+### Test 3 — route to the virtual microphone
+
+This is the real meeting use-case: your translated voice goes into the
+meeting as if it were your mic.
+
+```
+# Virtmic must be installed first (Stage 3). Then:
+cargo run --bin pipeline-stt-stdin -- --mic --secs 60 \
+    --sink translator_virtmic_sink --target-lang DE
+```
+
+In another terminal, confirm the virtmic source is receiving signal:
+
+```
+cargo run --bin pw-capture-wav -- /tmp/check-virtmic.wav \
+    --node translator_virtmic_source --secs 5
+ffmpeg -hide_banner -nostats -i /tmp/check-virtmic.wav \
+    -af volumedetect -f null /dev/null 2>&1 | grep max_volume
+# Expect: max_volume well above -90 dB when speech is flowing
+```
+
+Or just open a browser, pick "Translator Virtual Mic" as the mic, and
+confirm the other end hears your translated voice.
+
+### Latency budget
+
+| Stage | Typical latency |
+|---|---|
+| Speech end → Deepgram `speech_final` | 10–300ms |
+| Deepgram final transcript | <300ms |
+| DeepL `latency_optimized` | ~100–150ms |
+| ElevenLabs Flash v2.5 TTFB | ~150–300ms |
+| **Total: speech end → first audio byte** | **~600–1000ms** |
+
+Tune `endpointing_ms` in `DeepgramConfig::with_detect_language` (currently
+300ms) lower for snappier response at the cost of cutting trailing words.
+
+### Common issues at Stage 6
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ELEVENLABS_API_KEY / VOICE_ID not set — TTS disabled` | Missing env var | Add both to `.env` |
+| `ElevenLabs: connecting` log but no audio | WS connected but EL returned an error | Check `ERROR` lines — 401 = bad key, 422 = bad voice_id |
+| Audio plays but sounds like a generic voice | `VOICE_ID` wrong | Copy the exact ID from EL dashboard → Voices |
+| Audio crackles or drops out | Ring buffer too small or PCM bridge lagging | Ring is 2s at 44.1kHz — if EL is slow, it'll underrun; acceptable for now |
+| `--sink translator_virtmic_sink` but no signal on source | Virtmic not installed | Re-run Stage 3 Part 1 |
+| Audio plays to wrong speaker | Default sink reassigned | `pactl info \| grep "Default Sink"`; use `--sink NODE_NAME` to pin it |
+
+---
+
 ## What's not yet tested (because it doesn't exist yet)
 
 | Stage | Binary | What it'll do |
 |---|---|---|
-| 6 | (extends Stage 4 + audio-os virtmic) | Full Track 1, real meeting test |
-| 7 | (no new binary) | Track 2 prints translated subtitles to stdout |
+| 7 | (no new binary) | Track 2: capture meeting audio → STT → translate → print subtitles |
 | 8 | `translator` | The user-facing app — egui UI, both tracks, control window + subtitle overlay |
 
 This file gets a new section per stage as we build them.

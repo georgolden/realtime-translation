@@ -8,10 +8,12 @@
 mod capture;
 mod nodes;
 mod playback;
+mod streaming_playback;
 
 pub use capture::{capture_for_duration, AudioFormat, CaptureTarget};
 pub use nodes::{list_nodes, MediaClass, NodeInfo};
 pub use playback::{play_for_duration, PlaybackFormat, PlaybackTarget};
+pub use streaming_playback::{spawn_streaming_player, StreamingPlayerHandle};
 
 use thiserror::Error;
 

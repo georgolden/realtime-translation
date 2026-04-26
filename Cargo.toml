@@ -39,6 +39,7 @@ thiserror   = "2"
 log         = "0.4"
 env_logger  = "0.11"
 bytes       = "1"
+base64      = "0.22"
 
 # UI
 egui   = "0.32"

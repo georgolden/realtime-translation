@@ -171,9 +171,10 @@ impl DeepgramClient {
         // caller (binary or library).
         crate::ensure_crypto_provider();
 
-        // 8 frames ≈ 80 ms of latency at 100ms-per-frame Deepgram
-        // chunks. Non-blocking try_send drops on full.
-        let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(64);
+        // Large enough to absorb ~250ms of WS connect latency at 20ms/chunk
+        // (stereo 48kHz → ~10 chunks/s after resample = ~13 chunks burst).
+        // 512 gives ~5s of headroom; try_send still drops if truly full.
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(512);
         let (event_tx, event_rx) = mpsc::channel::<PipelineEvent>(256);
 
         tokio::spawn(async move {
