@@ -5,3 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+audio-os   = { workspace = true }
+pipeline   = { workspace = true }
+egui       = { workspace = true }
+eframe     = { workspace = true }
+tokio      = { workspace = true }
+dotenvy    = { workspace = true }
+anyhow     = { workspace = true }
+log        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+toml       = { workspace = true }

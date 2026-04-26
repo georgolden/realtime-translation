@@ -64,7 +64,10 @@ license.workspace = true
 [dependencies]
 audio-os    = { workspace = true }
 pipeline    = { workspace = true }
+ui          = { workspace = true }
 pipewire    = { workspace = true }
+egui        = { workspace = true }
+eframe      = { workspace = true }
 anyhow      = { workspace = true }
 log         = { workspace = true }
 env_logger  = { workspace = true }
