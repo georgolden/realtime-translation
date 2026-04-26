@@ -229,11 +229,221 @@ headphones, so the id can change.
 
 ---
 
+## Stage 3 — `pw-virtmic-tone` + virtual mic install
+
+**Purpose:** Stage 3 has two parts. First we install a PipeWire loopback
+module that creates `translator_virtmic_sink` (an audio sink we write into)
+and `translator_virtmic_source` (a fake microphone other apps can pick).
+Then we use `pw-virtmic-tone` to write a 440 Hz sine into the sink and
+confirm Firefox / Chromium / any meeting client sees it as a usable mic.
+
+### Part 0 — sanity test the writer alone (no install needed)
+
+Before touching the OS, confirm that `audio-os::play_for_duration` actually
+plays audio. Run with no flags — it plays to the **default sink** (your
+headphones).
+
+```
+cargo run --bin pw-virtmic-tone -- --secs 2 --volume 0.1
+```
+
+**Expected:** you hear a quiet 440 Hz beep for 2 seconds. Logs show:
+
+```
+[INFO  pw_virtmic_tone] playing 440.0 Hz tone for 2.0s (volume 0.10) to Default
+[INFO  audio_os::playback] playback negotiated format: rate=48000 channels=2
+[INFO  pw_virtmic_tone] done
+```
+
+If you don't hear anything but logs look fine, your default sink is wrong —
+check `wpctl status` to see which sink is the default.
+
+### Part 1 — install the virtual microphone
+
+This is a one-time OS-level setup. The config file is committed in the repo
+at [crates/audio-os/pipewire-conf/translator-virtmic.conf](../crates/audio-os/pipewire-conf/translator-virtmic.conf).
+
+```
+# 1. Make the user-level PipeWire config dir if it doesn't exist.
+mkdir -p ~/.config/pipewire/pipewire.conf.d
+
+# 2. Copy the config in.
+cp crates/audio-os/pipewire-conf/translator-virtmic.conf \
+   ~/.config/pipewire/pipewire.conf.d/
+
+# 3. Restart the user PipeWire stack. NOTE: this momentarily kills all your
+#    audio. BT headsets may briefly disconnect and re-pair.
+systemctl --user restart pipewire wireplumber pipewire-pulse
+
+# 4. Verify the new nodes exist.
+cargo run --bin pw-list-nodes
+```
+
+**Expected after step 4** — two new rows:
+
+```
+   id  class           name                              description
+   ?   source          translator_virtmic_source         Translator Virtual Mic
+   ?   sink            translator_virtmic_sink           Translator Virtual Mic
+```
+
+(IDs are assigned by PipeWire and change across restarts; that's why the
+rest of the app refers to them by `node.name`.)
+
+Cross-check via pactl:
+
+```
+pactl list short sources | grep translator
+pactl list short sinks | grep translator
+```
+
+Both should print one line each.
+
+**To uninstall** (e.g. if you want to try a different config):
+
+```
+rm ~/.config/pipewire/pipewire.conf.d/translator-virtmic.conf
+systemctl --user restart pipewire wireplumber pipewire-pulse
+```
+
+### Part 2 — write a tone into the virtmic and verify in a browser
+
+**Run, in one terminal:**
+
+```
+cargo run --bin pw-virtmic-tone -- \
+    --node-name translator_virtmic_sink \
+    --secs 30 \
+    --volume 0.2
+```
+
+The tone runs for 30 seconds. During that window:
+
+1. Open Firefox or Chromium.
+2. Go to a site that needs the mic — `https://webcammictest.com/check-microphone.html`
+   is a good one (no signup, shows live waveform).
+3. When prompted for mic permission, the browser will show its mic picker.
+   You should see **"Translator Virtual Mic"** in the list.
+4. Pick it. The site's level meter should immediately show a steady tone
+   (since a sine wave is constant amplitude, the meter pegs at one level).
+
+**Pass:** the tone is visible/audible in the browser test, your voice is
+**not** going through (because we picked the virtual mic, not the real one).
+
+### Part 3 — verify the loopback chain end-to-end (no browser)
+
+This is the most reliable test of the full chain — completely independent
+of any browser quirks (Chromium's WebRTC noise suppression, for example,
+will gate a pure 440 Hz sine to silence even though the mic itself works
+perfectly). Use this whenever something in the browser looks off.
+
+**Two terminals.** In **terminal A**, start the tone (foreground):
+
+```
+cargo run --bin pw-virtmic-tone -- --node-name translator_virtmic_sink --secs 30 --volume 0.5
+```
+
+In **terminal B**, while it's running:
+
+```
+# 1. Confirm our stream is connected to the sink.
+pw-link -i 2>&1 | grep -i translator
+# Expect:  translator_virtmic_sink:playback_FL
+#          translator_virtmic_sink:playback_FR
+
+# 2. Find the source's id.
+cargo run --bin pw-list-nodes
+#   Look for translator_virtmic_source (class=source). Note its id.
+
+# 3. Capture from the source side and measure signal.
+cargo run --bin pw-capture-wav -- /tmp/cap-virtsrc.wav --node SOURCE_ID --secs 3
+ffmpeg -hide_banner -nostats -i /tmp/cap-virtsrc.wav -af volumedetect -f null /dev/null 2>&1 \
+    | grep -E "mean_volume|max_volume"
+```
+
+**Pass:** with `--volume 0.5`, expect roughly:
+
+```
+mean_volume: -9.0 dB
+max_volume:  -6.0 dB
+```
+
+(A 0.5 amplitude sine has −6.02 dB peak by definition. Anything close
+means the loopback is forwarding cleanly.)
+
+**Listening to the file:**
+
+```
+paplay /tmp/cap-virtsrc.wav
+```
+
+⚠️ `paplay` plays to the **default sink**, which may not be the device
+you're listening on. PipeWire often reassigns the default sink when you
+plug in a USB device — and some USB mic dongles also expose an output
+endpoint that PipeWire then promotes to default. If `paplay` produces
+silence but the volumedetect numbers above were correct, the file is
+fine; you just played it to the wrong device. Two ways to check:
+
+```
+# Which sink is currently default?
+pactl info | grep "Default Sink"
+
+# Force playback to a specific sink (e.g. the BT headphones):
+paplay --device=bluez_output.41_42_FF_8A_6D_53.1 /tmp/cap-virtsrc.wav
+
+# Or change the default sink for this session:
+wpctl set-default $(pw-cli ls Node | grep -B1 'bluez_output' | head -1 | awk '{print $2}' | tr -d ',')
+```
+
+A common Linux gotcha: a USB headset/mic dongle registers as both
+`alsa_input.usb-...` (the mic) and `alsa_output.usb-...` (a built-in
+speaker the dongle technically has, even if there's no speaker plugged
+into it). When PipeWire sees the new output it switches the default
+sink to it, and your normal speakers go silent.
+
+### Part 4 (optional) — verify in a browser
+
+This is a "nice to have" check but Chromium specifically interferes:
+its default `getUserMedia` constraints enable WebRTC noise suppression,
+auto gain, and echo cancellation, which **delete a pure tone** because
+they treat steady audio as background noise. If the browser shows no
+signal but Part 3 passed, the browser is doing this — it's not a bug
+in our code.
+
+To bypass the WebRTC processing, use the WebRTC samples page that
+exposes the constraints as checkboxes:
+
+> **https://webrtc.github.io/samples/src/content/getusermedia/audio/**
+
+1. Pick "Translator Virtual Mic (source — selectable in meeting clients)"
+   from the dropdown.
+2. Untick **all three** audio-processing checkboxes
+   (Echo cancellation, Noise suppression, Auto gain).
+3. The waveform should now show your sine cleanly.
+
+For the actual app (Stage 6+) we'll send speech, not tones, so WebRTC
+processing is no longer destructive — speech has the spectral richness
+that fools the noise suppressor. So it's fine to consider Stage 3 done
+even if Part 4 doesn't work perfectly.
+
+### Common issues at Stage 3
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| After `systemctl restart`, no audio anywhere | Service didn't come back up | `systemctl --user status pipewire` — restart again or check journal |
+| `pw-list-nodes` doesn't show the virtmic | Config syntax error or wrong path | `journalctl --user -u pipewire -n 50` for parser errors; verify path is `~/.config/pipewire/pipewire.conf.d/translator-virtmic.conf` |
+| `paplay /tmp/cap-virtsrc.wav` is silent but volumedetect showed signal | Default sink got reassigned to a device that isn't audible (e.g. a USB mic dongle that also exposes a fake speaker endpoint) | `pactl info \| grep "Default Sink"` to see; play with `paplay --device=NODE_NAME` or run `wpctl set-default ID` to switch back |
+| Browser doesn't list "Translator Virtual Mic" | Browser cached the old mic list | Reload the page; some sites need the tab fully restarted |
+| Tone runs, sink shows signal in pavucontrol, but Chromium-based browser shows no signal | WebRTC noise suppression / AGC strips out steady tones | Use the WebRTC samples page (linked in Part 4) and untick all 3 audio-processing checkboxes; or skip — speech in Stage 6+ won't be affected |
+| `cargo run --bin pw-virtmic-tone -- --node-name translator_virtmic_sink` fails to connect | Virtmic not installed yet, or service didn't load it | Re-do Part 1 |
+| BT headset stuck in HFP after restart and sounds awful | WirePlumber profile autoswap | `wpctl status` shows the BT device's active profile; switch to A2DP via `wpctl set-profile DEVICE_ID INDEX` |
+
+---
+
 ## What's not yet tested (because it doesn't exist yet)
 
 | Stage | Binary | What it'll do |
 |---|---|---|
-| 3 | `pw-virtmic-tone` | Play a 440 Hz tone into the translator virtual mic; verify in Firefox's mic picker |
 | 4 | `pipeline-stt-stdin` | Stream a wav into Deepgram; print transcripts |
 | 5 | (extends Stage 4) | Add DeepL output to the same binary |
 | 6 | (extends Stage 4 + audio-os virtmic) | Full Track 1, real meeting test |

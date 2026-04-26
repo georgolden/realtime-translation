@@ -85,3 +85,7 @@ path = "src/bin/pw-list-nodes.rs"
 [[bin]]
 name = "pw-capture-wav"
 path = "src/bin/pw-capture-wav.rs"
+
+[[bin]]
+name = "pw-virtmic-tone"
+path = "src/bin/pw-virtmic-tone.rs"
