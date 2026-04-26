@@ -591,11 +591,124 @@ defaults; edit them in `crates/pipeline/src/transcript.rs`.
 
 ---
 
+## Stage 5 — DeepL translation
+
+**Purpose:** wire DeepL HTTP translation into the `pipeline-stt-stdin` binary
+so that every `FLUSHED` event is immediately translated and printed as a
+`TRANSLATED` line. Verifies the rolling context buffer keeps sentence meaning
+coherent across thinking pauses.
+
+### Setup
+
+You need a DeepL API key. Put it in `.env` alongside the Deepgram key:
+
+```
+DEEPL_API_KEY=...
+```
+
+Free-tier keys end in `:fx` and use `api-free.deepl.com`; paid keys use
+`api.deepl.com`. The binary auto-detects this from the key suffix.
+
+If `DEEPL_API_KEY` is absent the binary falls back to Stage 4 mode (STT
+only) and logs `translation disabled`. This lets you run either stage with
+the same binary.
+
+### Flags reference
+
+| Flag | Default | Description |
+|---|---|---|
+| `--target-lang CODE` | `EN` | DeepL target language (e.g. `DE`, `NL`, `IT`, `ES`) |
+| `--source-lang CODE` | *(auto-detect)* | Pin DeepL source language; omit to let DeepL detect |
+| `--context N` | `5` | How many prior sentences to send as DeepL context |
+| `--language CODE` | *(auto-detect)* | Deepgram STT language; omit for `multi` mode |
+
+### Test 1 — wav replay with translation
+
+```
+# Record a clip with 2–3 sentences first (if you don't have one already):
+cargo run --bin pw-capture-wav -- /tmp/utt.wav --secs 15
+
+# Replay — source auto-detected, translate to English (default):
+cargo run --bin pipeline-stt-stdin -- --wav /tmp/utt.wav
+
+# Translate German recording to English explicitly:
+cargo run --bin pipeline-stt-stdin -- --wav /tmp/utt.wav --source-lang DE --target-lang EN
+
+# Translate to Dutch:
+cargo run --bin pipeline-stt-stdin -- --wav /tmp/utt.wav --target-lang NL
+```
+
+**Expected output shape (German recording → EN):**
+
+```
+[INFO ...] Deepgram model=nova-3 language=auto-detect (multi); buffer punct>=30 max>=240 silence=1500ms
+[INFO ...] DeepL auto → EN (latency_optimized); context window = 5 sentences
+[  2334 ms] PARTIAL    Abends
+[  4988 ms] PARTIAL    Abends nach der Arbeit treffe ich mich oft mit Freunden.
+[  6173 ms] FINALISED  Abends nach der Arbeit treffe ich mich oft mit Freunden.
+[  6173 ms] FLUSHED    (punctuation)  Abends nach der Arbeit treffe ich mich oft mit Freunden.
+[  6350 ms] TRANSLATED [→ EN]  In the evenings after work, I often meet up with friends.
+[  9971 ms] FINALISED  Am Wochenende kann ich gut abschalten und entspannen.
+[  9971 ms] FLUSHED    (punctuation)  Am Wochenende kann ich gut abschalten und entspannen.
+[ 10053 ms] TRANSLATED [→ EN]  At the weekend I can really switch off and relax.
+```
+
+**What to check:**
+
+1. `TRANSLATED` appears within ~100–200ms of `FLUSHED` — that's DeepL's
+   `latency_optimized` RTT. If it takes >500ms check your network.
+2. Both Deepgram and DeepL auto-detect the source language — you should
+   not need `--source-lang` or `--language` for the common case.
+3. The second sentence translation benefits from the context of the first —
+   pronouns and topic references resolve better than they would in isolation.
+4. `PARTIAL` and `FINALISED` lines continue to arrive while DeepL is running
+   — translation does not block the STT event stream.
+
+### Test 2 — live mic with translation
+
+```
+# Auto-detect everything, translate to English (default):
+cargo run --bin pipeline-stt-stdin -- --mic --secs 30
+
+# Speak German, get Dutch translation:
+cargo run --bin pipeline-stt-stdin -- --mic --secs 30 --target-lang NL
+
+# Narrow context window for faster speakers:
+cargo run --bin pipeline-stt-stdin -- --mic --secs 30 --context 3
+```
+
+Speak a few sentences with natural pauses. After each sentence boundary
+(punctuation flush or silence flush) a `TRANSLATED` line should arrive
+within ~200ms.
+
+### Context buffer tuning
+
+The context window (default 5) is the number of prior *source* sentences
+passed to DeepL alongside the current one. DeepL uses them to resolve
+pronouns and maintain topic consistency — the context characters are not
+billed. Tune via `--context N`:
+
+- Increase if translations lose thread across long pauses.
+- Decrease if you notice translation RTT climbing (more context = slightly
+  larger request).
+
+### Common issues at Stage 5
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `translation disabled` log | `DEEPL_API_KEY` not in env or `.env` | Add it to `.env` at the project root |
+| `DeepL HTTP 403` | Wrong key or key not activated | Check the key at deepl.com; free keys end in `:fx` |
+| `DeepL HTTP 456` | Monthly character quota exhausted | Free tier = 500k chars/month; upgrade or wait for reset |
+| `TRANSLATED` never appears | DeepL call hanging | Check endpoint reachable: `curl -s https://api-free.deepl.com/v2/translate` |
+| Source not detected correctly | DeepL mis-detecting short sentences | Add `--source-lang DE` (or whichever language) to pin it |
+| Translation quality poor for a language pair | `latency_optimized` weaker for some pairs | Edit `model_type` to `prefer_quality_optimized` in `crates/pipeline/src/deepl.rs` |
+
+---
+
 ## What's not yet tested (because it doesn't exist yet)
 
 | Stage | Binary | What it'll do |
 |---|---|---|
-| 5 | (extends Stage 4) | Add DeepL output to the same binary |
 | 6 | (extends Stage 4 + audio-os virtmic) | Full Track 1, real meeting test |
 | 7 | (no new binary) | Track 2 prints translated subtitles to stdout |
 | 8 | `translator` | The user-facing app — egui UI, both tracks, control window + subtitle overlay |

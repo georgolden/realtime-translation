@@ -15,6 +15,7 @@ anyhow             = { workspace = true }
 thiserror          = { workspace = true }
 log                = { workspace = true }
 bytes              = { workspace = true }
+reqwest            = { workspace = true }
 # Pulled in transitively via tokio-tungstenite; we depend on it
 # directly so we can install the `ring` crypto provider exactly once
 # at startup. Without this, the rustls 0.23 inside tungstenite panics

@@ -21,12 +21,18 @@ pub enum PipelineEvent {
         track: TrackId,
         text:  String,
     },
-    /// The transcript buffer flushed — this is the chunk we'd hand to
-    /// translation (Stage 5+). At Stage 4 the binary just prints it.
+    /// The transcript buffer flushed. Source text is ready; translation
+    /// will arrive shortly as a `Translated` event.
     Flushed {
         track:   TrackId,
         text:    String,
         reason:  FlushReasonStr,
+    },
+    /// DeepL returned a translation for a flushed chunk.
+    Translated {
+        track:        TrackId,
+        source_text:  String,
+        translated:   String,
     },
     /// A non-fatal error from one of the streaming components. The
     /// pipeline keeps running.

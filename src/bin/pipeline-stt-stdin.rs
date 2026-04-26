@@ -1,21 +1,28 @@
-//! pipeline-stt-stdin — stream audio into Deepgram and print transcript
-//! events. Stage 4 manual-testing harness.
+//! pipeline-stt-stdin — stream audio into Deepgram and print transcript +
+//! translation events. Stage 4 + Stage 5 manual-testing harness.
 //!
 //! Usage:
-//!   pipeline-stt-stdin --wav FILE [--language CODE]
-//!   pipeline-stt-stdin --mic       [--secs N]  [--language CODE]
+//!   pipeline-stt-stdin --wav FILE [--language CODE] [--source-lang CODE] [--target-lang CODE]
+//!   pipeline-stt-stdin --mic       [--secs N]  [--language CODE] [--source-lang CODE] [--target-lang CODE]
 //!
-//! Language detection:
-//!   Default (no --language flag): Deepgram auto-detects the language.
-//!   With --language de (or any BCP-47 code): fixed language, no detection.
-//!   Note: --detect-language is not a flag; detection is the default.
+//! Deepgram language (STT):
+//!   Default (no --language): Deepgram auto-detects the language.
+//!   --language de: fix STT language, disables auto-detect.
+//!
+//! DeepL translation:
+//!   Requires DEEPL_API_KEY in .env or environment.
+//!   --source-lang: pin DeepL source language (default: auto-detect).
+//!   --target-lang: DeepL target language (default: EN).
+//!   Omit DEEPL_API_KEY to skip translation and run Stage 4 only.
 //!
 //! Examples:
 //!   cargo run --bin pipeline-stt-stdin -- --mic --secs 20
-//!   cargo run --bin pipeline-stt-stdin -- --mic --secs 20 --language de
-//!   cargo run --bin pipeline-stt-stdin -- --wav /tmp/cap-mic.wav
+//!   cargo run --bin pipeline-stt-stdin -- --mic --secs 20 --target-lang DE
+//!   cargo run --bin pipeline-stt-stdin -- --wav /tmp/cap-mic.wav --target-lang NL
+//!   cargo run --bin pipeline-stt-stdin -- --wav /tmp/cap-mic.wav --source-lang DE --target-lang EN
 //!
-//! Reads `DEEPGRAM_API_KEY` from `.env` (project root) or the environment.
+//! Reads `DEEPGRAM_API_KEY` and `DEEPL_API_KEY` from `.env` (project root)
+//! or the environment.
 
 use std::env;
 use std::path::PathBuf;
@@ -23,8 +30,8 @@ use std::time::Duration;
 
 use audio_os::{capture_for_duration, AudioFormat, CaptureTarget};
 use pipeline::{
-    DeepgramClient, DeepgramConfig, PipelineEvent, ResampleState,
-    TrackId, TranscriptBufferConfig,
+    DeepgramClient, DeepgramConfig, DeepLClient, DeepLConfig, PipelineEvent,
+    ResampleState, TrackId, TranscriptBufferConfig, TranslationContext,
 };
 
 #[tokio::main]
@@ -36,15 +43,15 @@ async fn main() -> anyhow::Result<()> {
 
     let opts = parse_args()?;
 
-    let api_key = env::var("DEEPGRAM_API_KEY")
+    let dg_api_key = env::var("DEEPGRAM_API_KEY")
         .map_err(|_| anyhow::anyhow!("DEEPGRAM_API_KEY not set (check .env)"))?;
 
     let dg_cfg = match opts.language {
-        Some(ref lang) => DeepgramConfig::with_language(api_key, lang.as_str()),
-        None           => DeepgramConfig::with_detect_language(api_key),
+        Some(ref lang) => DeepgramConfig::with_language(dg_api_key, lang.as_str()),
+        None           => DeepgramConfig::with_detect_language(dg_api_key),
     };
     let buf_cfg = TranscriptBufferConfig::default();
-    // "multi" is the internal sentinel for multilingual auto-detect.
+
     let lang_display = if dg_cfg.language == "multi" { "auto-detect (multi)" } else { &dg_cfg.language };
     log::info!(
         "Deepgram model={} language={}; buffer punct>={} max>={} silence={}ms",
@@ -55,12 +62,33 @@ async fn main() -> anyhow::Result<()> {
         buf_cfg.silence_flush.as_millis(),
     );
 
+    // Stage 5: DeepL is optional — skip if no key is set.
+    let deepl: Option<(DeepLClient, usize)> = env::var("DEEPL_API_KEY").ok().map(|key| {
+        let mut cfg = DeepLConfig::new(key, opts.source_lang.as_deref(), &opts.target_lang);
+        cfg.context_sentences = opts.context_sentences;
+        let src_display = cfg.source_lang.as_deref().unwrap_or("auto");
+        log::info!(
+            "DeepL {} → {} ({}); context window = {} sentences",
+            src_display, cfg.target_lang, cfg.model_type, cfg.context_sentences,
+        );
+        let ctx_size = cfg.context_sentences;
+        (DeepLClient::new(cfg), ctx_size)
+    });
+
+    if deepl.is_none() {
+        log::info!("DEEPL_API_KEY not set — translation disabled (Stage 4 mode)");
+    }
+
     let (handle, mut events) =
         DeepgramClient::spawn(dg_cfg, buf_cfg, TrackId::Outgoing);
 
     // Print events as they arrive in the foreground task.
+    let target_lang = opts.target_lang.clone();
     let printer = tokio::spawn(async move {
         let t0 = std::time::Instant::now();
+        let ctx_capacity = deepl.as_ref().map(|(_, n)| *n).unwrap_or(4);
+        let mut ctx = TranslationContext::new(ctx_capacity);
+
         while let Some(evt) = events.recv().await {
             let dt_ms = t0.elapsed().as_millis();
             match evt {
@@ -72,6 +100,29 @@ async fn main() -> anyhow::Result<()> {
                 }
                 PipelineEvent::Flushed { text, reason, .. } => {
                     println!("[{dt_ms:>6} ms] FLUSHED    ({reason})  {text}");
+
+                    if let Some((ref dl, _)) = deepl {
+                        let context = ctx.push_and_context(&text);
+                        match dl.translate(&text, &context).await {
+                            Ok(translated) => {
+                                println!(
+                                    "[{:>6} ms] TRANSLATED [→ {}]  {}",
+                                    t0.elapsed().as_millis(),
+                                    target_lang.to_uppercase(),
+                                    translated,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[{:>6} ms] DEEPL ERR  {e}",
+                                    t0.elapsed().as_millis()
+                                );
+                            }
+                        }
+                    }
+                }
+                PipelineEvent::Translated { source_text, translated, .. } => {
+                    println!("[{dt_ms:>6} ms] TRANSLATED {source_text} → {translated}");
                 }
                 PipelineEvent::Error { error, .. } => {
                     eprintln!("[{dt_ms:>6} ms] ERROR      {error}");
@@ -80,8 +131,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Feed audio to the handle on a background task that's source-
-    // specific (wav vs. mic).
+    // Feed audio to the handle on a background task that's source-specific.
     match opts.mode {
         Mode::Wav(path)  => feed_from_wav(&path, &handle).await?,
         Mode::Mic(secs)  => feed_from_mic(secs, &handle).await?,
@@ -106,17 +156,24 @@ enum Mode {
 
 #[derive(Debug)]
 struct Opts {
-    mode:     Mode,
-    /// `None`  → auto-detect language (default, no --language flag given).
-    /// `Some`  → fixed BCP-47 code passed via --language; detection disabled.
-    language: Option<String>,
+    mode:             Mode,
+    /// Deepgram STT language. `None` → auto-detect (multi).
+    language:         Option<String>,
+    /// DeepL source language. `None` → DeepL auto-detects.
+    source_lang:      Option<String>,
+    /// DeepL target language (uppercase). Default: "EN".
+    target_lang:      String,
+    /// Context window size in sentences. Default: 5.
+    context_sentences: usize,
 }
 
 fn parse_args() -> anyhow::Result<Opts> {
     let mut args = env::args().skip(1);
     let mut mode: Option<Mode> = None;
-    // Default: None = auto-detect. Set to Some when --language is given.
     let mut language: Option<String> = None;
+    let mut source_lang: Option<String> = None;
+    let mut target_lang = "EN".to_string();
+    let mut context_sentences: usize = 5;
     let mut mic_secs = 30.0f32;
 
     while let Some(a) = args.next() {
@@ -142,12 +199,30 @@ fn parse_args() -> anyhow::Result<Opts> {
                 }
             }
             "--language" => {
-                // Providing --language explicitly disables auto-detection.
-                // There is no --detect-language flag; detection is the default.
                 language = Some(
                     args.next()
                         .ok_or_else(|| anyhow::anyhow!("--language needs a BCP-47 code (e.g. en, de, nl)"))?
                 );
+            }
+            "--source-lang" => {
+                source_lang = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--source-lang needs a code (e.g. DE, EN)"))?
+                        .to_uppercase()
+                );
+            }
+            "--target-lang" => {
+                target_lang = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--target-lang needs a code (e.g. EN, DE, NL)"))?
+                    .to_uppercase();
+            }
+            "--context" => {
+                context_sentences = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--context needs a number of sentences"))?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--context must be a positive integer"))?;
             }
             "--detect-language" => {
                 anyhow::bail!(
@@ -157,10 +232,16 @@ fn parse_args() -> anyhow::Result<Opts> {
             }
             "-h" | "--help" => {
                 eprintln!(concat!(
-                    "usage: pipeline-stt-stdin [--wav FILE | --mic] [--secs N] [--language CODE]\n",
+                    "usage: pipeline-stt-stdin [--wav FILE | --mic] [--secs N]\n",
+                    "                          [--language CODE] [--source-lang CODE]\n",
+                    "                          [--target-lang CODE] [--context N]\n",
                     "\n",
-                    "Language: omit --language to auto-detect (default).\n",
-                    "          --language de  fixes the language and disables detection.",
+                    "STT:          --language de  fixes Deepgram language (default: auto-detect).\n",
+                    "Translation:  requires DEEPL_API_KEY in .env or environment.\n",
+                    "              --source-lang DE  pin DeepL source (default: auto-detect).\n",
+                    "              --target-lang EN  DeepL target language (default: EN).\n",
+                    "              --context 5       context window in sentences (default: 5).\n",
+                    "              Omit DEEPL_API_KEY to run Stage 4 (STT only).",
                 ));
                 std::process::exit(0);
             }
@@ -173,7 +254,7 @@ fn parse_args() -> anyhow::Result<Opts> {
         Mode::Mic(_) => Mode::Mic(mic_secs),
         m => m,
     };
-    Ok(Opts { mode, language })
+    Ok(Opts { mode, language, source_lang, target_lang, context_sentences })
 }
 
 // ============================================================
@@ -194,8 +275,6 @@ async fn feed_from_wav(
         reader.len(),
     );
 
-    // Convert to interleaved f32 in-memory. Wav files we record in
-    // pw-capture-wav are 32-bit float; allow 16-bit int too.
     let samples_f32: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
@@ -210,8 +289,6 @@ async fn feed_from_wav(
         }
     };
 
-    // Resample/feed in 20 ms chunks paced at real-time, so Deepgram's
-    // endpointing fires the way it would on a live stream.
     let in_rate = spec.sample_rate;
     let in_ch   = spec.channels;
     let mut rs = ResampleState::new(in_rate, in_ch)?;
@@ -245,8 +322,6 @@ async fn feed_from_mic(
 ) -> anyhow::Result<()> {
     log::info!("mic: capturing default source for {secs:.1}s — start speaking");
 
-    // PipeWire's capture loop is sync — run it on a dedicated thread.
-    // Push 16 kHz i16 mono into Deepgram via a clone of the handle.
     let handle_for_capture = handle.clone();
     let capture_thread = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut state: Option<ResampleState> = None;
