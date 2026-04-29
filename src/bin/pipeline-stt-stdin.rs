@@ -36,7 +36,7 @@ use audio_os::{
 };
 use pipeline::{
     elevenlabs_spawn, DeepgramClient, DeepgramConfig, DeepLClient, DeepLConfig,
-    ElevenLabsConfig, PipelineEvent, ResampleState, TrackId, TranscriptBufferConfig,
+    ElevenLabsConfig, PipelineEvent, ResampleState, TrackId,
     TranslationContext,
 };
 
@@ -57,13 +57,10 @@ async fn main() -> anyhow::Result<()> {
         Some(ref lang) => DeepgramConfig::with_language(dg_api_key, lang.as_str()),
         None           => DeepgramConfig::with_detect_language(dg_api_key),
     };
-    let buf_cfg = TranscriptBufferConfig::default();
     let lang_display = if dg_cfg.language == "multi" { "auto-detect (multi)" } else { &dg_cfg.language };
     log::info!(
-        "Deepgram model={} language={}; buffer punct>={} max>={} silence={}ms",
+        "Deepgram model={} language={}",
         dg_cfg.model, lang_display,
-        buf_cfg.min_chars_for_punct_flush, buf_cfg.max_chars_before_flush,
-        buf_cfg.silence_flush.as_millis(),
     );
 
     // ── Stage 5: DeepL (optional) ─────────────────────────────────────
@@ -130,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-    let (handle, mut events) = DeepgramClient::spawn(dg_cfg, buf_cfg, TrackId::Outgoing);
+    let (handle, mut events) = DeepgramClient::spawn(dg_cfg, TrackId::Outgoing);
 
     // ── Event printer + translation + TTS dispatch ────────────────────
     let target_lang  = opts.target_lang.clone();

@@ -9,6 +9,8 @@
 //! Source language defaults to `None` (DeepL auto-detects). Pass an explicit
 //! BCP-47 code to pin it.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the DeepL client.
@@ -101,6 +103,14 @@ impl DeepLClient {
             context:     if context.is_empty() { None } else { Some(context.to_string()) },
         };
 
+        let t0 = ts();
+        log::info!(
+            "[{}] DeepL send  text={:?}  ctx={:?}",
+            t0, text,
+            if context.is_empty() { "(none)" } else { context }
+        );
+        let sent_at = std::time::Instant::now();
+
         let resp = self
             .http
             .post(&url)
@@ -116,8 +126,25 @@ impl DeepLClient {
         }
 
         let result: TranslateResponse = resp.json().await?;
-        Ok(result.translations.into_iter().next().map(|t| t.text).unwrap_or_default())
+        let translated = result.translations.into_iter().next().map(|t| t.text).unwrap_or_default();
+        let elapsed_ms = sent_at.elapsed().as_millis();
+
+        log::info!(
+            "[{}] DeepL recv +{}ms | {:?} → {:?}",
+            t0, elapsed_ms, text, translated
+        );
+
+        Ok(translated)
     }
+}
+
+fn ts() -> String {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let s  = (ms / 1000) % 86400;
+    format!("{:02}:{:02}:{:02}.{:03}", s / 3600, (s % 3600) / 60, s % 60, ms % 1000)
 }
 
 // --- Wire types ---

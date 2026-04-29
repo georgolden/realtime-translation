@@ -1,18 +1,14 @@
 //! Deepgram streaming-STT client.
 //!
 //! One persistent WebSocket connection per track. Audio in (i16 LE @
-//! 16 kHz mono), JSON events out. The client owns the `TranscriptBuffer`
-//! and emits `PipelineEvent`s that are already filtered/aggregated.
-//!
-//! See:
-//! - DESIGN.md §4.5
-//! - realtime_translator_spec.md → "Deepgram Streaming STT"
-//! - https://developers.deepgram.com/docs/live-streaming-audio
+//! 16 kHz mono), JSON events out. Every committed `is_final` chunk is
+//! forwarded directly to the translation layer — no local buffering.
+//! DeepL's context window provides coherence across fragment boundaries.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::Deserialize;
@@ -23,7 +19,6 @@ use tokio_tungstenite::{
 };
 
 use crate::events::{PipelineEvent, TrackId};
-use crate::transcript::{BufferOutput, TranscriptBuffer, TranscriptBufferConfig};
 use crate::PipelineError;
 
 #[derive(Debug, Clone)]
@@ -64,7 +59,7 @@ impl DeepgramConfig {
             sample_rate:      16_000,
             channels:         1,
             interim_results:  true,
-            endpointing_ms:   300,
+            endpointing_ms:   200,
             utterance_end_ms: 1000,
             smart_format:     true,
             punctuate:        true,
@@ -110,6 +105,20 @@ impl DeepgramConfig {
 
 fn bool_str(b: bool) -> &'static str {
     if b { "true" } else { "false" }
+}
+
+/// Wall-clock timestamp as `HH:MM:SS.mmm` for latency logging.
+fn ts() -> String {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let s  = (ms / 1000) % 86400;
+    let h  = s / 3600;
+    let m  = (s % 3600) / 60;
+    let sc = s % 60;
+    let ms = ms % 1000;
+    format!("{h:02}:{m:02}:{sc:02}.{ms:03}")
 }
 
 /// Handle the caller uses to feed audio in + receive events out.
@@ -162,9 +171,8 @@ impl DeepgramClient {
     /// Caller can ignore the JoinHandle — the task ends when the
     /// audio channel closes.
     pub fn spawn(
-        cfg:        DeepgramConfig,
-        buffer_cfg: TranscriptBufferConfig,
-        track:      TrackId,
+        cfg:   DeepgramConfig,
+        track: TrackId,
     ) -> (DeepgramHandle, mpsc::Receiver<PipelineEvent>) {
         // rustls 0.23 panics on first TLS handshake unless a crypto
         // provider has been installed. Doing it here covers every
@@ -183,7 +191,7 @@ impl DeepgramClient {
             // sender hanging open. Without this, every push_pcm logs an
             // error after the panic.
             let result = AssertUnwindSafe(run_client(
-                cfg, buffer_cfg, track, audio_rx, event_tx.clone(),
+                cfg, track, audio_rx, event_tx.clone(),
             ))
             .catch_unwind()
             .await;
@@ -222,13 +230,15 @@ impl DeepgramClient {
 
 async fn run_client(
     cfg:        DeepgramConfig,
-    buffer_cfg: TranscriptBufferConfig,
     track:      TrackId,
     mut audio_rx: mpsc::Receiver<Vec<i16>>,
     event_tx:   mpsc::Sender<PipelineEvent>,
 ) -> Result<(), PipelineError> {
     let url = cfg.build_url();
-    log::info!("Deepgram: connecting to {}", cfg.endpoint);
+    log::info!(
+        "Deepgram: connecting — params: {}",
+        url.split_once('?').map(|(_, q)| q).unwrap_or("(none)")
+    );
 
     // Build the request manually so we can attach the auth header.
     let mut req = url
@@ -246,16 +256,8 @@ async fn run_client(
 
     let (mut ws_sink, mut ws_stream) = ws.split();
 
-    // Buffer + tick task share state. Easiest: keep buffer here, run
-    // recv on audio + ws + tick from the same select loop. Single-task,
-    // no shared state.
-    let mut buf = TranscriptBuffer::new(buffer_cfg);
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     loop {
         tokio::select! {
-            // Outgoing: PCM samples → binary frame.
             maybe_samples = audio_rx.recv() => {
                 match maybe_samples {
                     Some(samples) => {
@@ -266,28 +268,17 @@ async fn run_client(
                         }
                     }
                     None => {
-                        // Audio source finished. Send CloseStream so
-                        // Deepgram returns finals before closing.
                         let close = serde_json::json!({ "type": "CloseStream" });
                         let _ = ws_sink.send(Message::Text(close.to_string().into())).await;
-                        // Continue draining ws messages until it closes.
-                        // We exit the audio branch by setting the channel
-                        // to a closed receiver — easiest to set a flag.
                         break;
                     }
                 }
             }
 
-            // Incoming: JSON results from Deepgram.
             maybe_msg = ws_stream.next() => {
                 match maybe_msg {
                     Some(Ok(msg)) => {
-                        if let Err(e) = handle_ws_message(
-                            msg,
-                            &mut buf,
-                            &event_tx,
-                            track,
-                        ).await {
+                        if let Err(e) = handle_ws_message(msg, &event_tx, track).await {
                             log::warn!("Deepgram: bad ws message: {e}");
                         }
                     }
@@ -301,31 +292,15 @@ async fn run_client(
                     }
                 }
             }
-
-            // Periodic: silence-based flushes.
-            _ = tick.tick() => {
-                if let Some(out) = buf.on_tick(Instant::now()) {
-                    emit_buffer_output(&event_tx, track, out).await;
-                }
-            }
         }
     }
 
-    // Drain any remaining ws messages after CloseStream so we get the
-    // tail finals and any UtteranceEnd.
+    // Drain tail finals after CloseStream.
     while let Some(msg) = ws_stream.next().await {
         match msg {
-            Ok(m) => {
-                let _ = handle_ws_message(m, &mut buf, &event_tx, track).await;
-            }
+            Ok(m) => { let _ = handle_ws_message(m, &event_tx, track).await; }
             Err(_) => break,
         }
-    }
-
-    // On EOF, flush whatever's left so the caller's last words don't
-    // get silently dropped.
-    if let Some(out) = buf.flush_now() {
-        emit_buffer_output(&event_tx, track, out).await;
     }
 
     Ok(())
@@ -333,7 +308,6 @@ async fn run_client(
 
 async fn handle_ws_message(
     msg:      Message,
-    buf:      &mut TranscriptBuffer,
     event_tx: &mpsc::Sender<PipelineEvent>,
     track:    TrackId,
 ) -> Result<(), PipelineError> {
@@ -343,35 +317,24 @@ async fn handle_ws_message(
         Message::Close(_) => return Ok(()),
     };
 
-    // Deepgram emits two top-level shapes: transcript Results and
-    // metadata. We dispatch on `type`.
     let raw: serde_json::Value = serde_json::from_str(&text)?;
     let kind = raw.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match kind {
         "Results" => {
             let parsed: ResultsMsg = serde_json::from_value(raw)?;
-            handle_result(parsed, buf, event_tx, track).await;
+            handle_result(parsed, event_tx, track).await;
         }
-        "UtteranceEnd" => {
-            log::debug!("Deepgram: UtteranceEnd");
-            if let Some(out) = buf.on_utterance_end() {
-                emit_buffer_output(event_tx, track, out).await;
-            }
-        }
-        "Metadata" | "SpeechStarted" | "Warning" => {
-            log::trace!("Deepgram: {kind}");
-        }
-        other => {
-            log::trace!("Deepgram: unknown message type '{other}'");
-        }
+        "UtteranceEnd" => log::info!("[{}] UtteranceEnd (no-op)", ts()),
+        "SpeechStarted" => log::info!("[{}] SpeechStarted", ts()),
+        "Metadata" | "Warning" => log::trace!("Deepgram: {kind}"),
+        other => log::trace!("Deepgram: unknown message type '{other}'"),
     }
     Ok(())
 }
 
 async fn handle_result(
     msg:      ResultsMsg,
-    buf:      &mut TranscriptBuffer,
     event_tx: &mpsc::Sender<PipelineEvent>,
     track:    TrackId,
 ) {
@@ -381,41 +344,28 @@ async fn handle_result(
         .first()
         .map(|a| a.transcript.as_str())
         .unwrap_or("");
-    if transcript.trim().is_empty() {
-        return;
-    }
 
     if msg.is_final {
-        let outputs = buf.on_final(transcript, Instant::now());
-        for o in outputs {
-            emit_buffer_output(event_tx, track, o).await;
+        if transcript.trim().is_empty() {
+            log::info!("[{}] is_final speech_final={} EMPTY (skipped)", ts(), msg.speech_final);
+            return;
         }
-        // Note: speech_final is an additional hint that endpointing
-        // fired. We *could* force a flush here, but DESIGN §4.4 routes
-        // all flush triggers through the buffer's own logic for
-        // consistency. The endpointing-driven UtteranceEnd will arrive
-        // shortly after and trigger the flush.
-    } else {
-        // is_final=false → partial. Surface to UI; don't mutate buffer.
-        let p = buf.on_partial(transcript.to_string()).to_string();
-        let _ = event_tx.send(PipelineEvent::Partial { track, text: p }).await;
-    }
-}
-
-async fn emit_buffer_output(
-    event_tx: &mpsc::Sender<PipelineEvent>,
-    track:    TrackId,
-    out:      BufferOutput,
-) {
-    let evt = match out {
-        BufferOutput::Finalised { text } => PipelineEvent::Finalised { track, text },
-        BufferOutput::Flushed { text, reason } => PipelineEvent::Flushed {
+        log::info!("[{}] is_final speech_final={} → DeepL {:?}", ts(), msg.speech_final, transcript);
+        let _ = event_tx.send(PipelineEvent::Flushed {
             track,
-            text,
-            reason: reason.as_str(),
-        },
-    };
-    let _ = event_tx.send(evt).await;
+            text:   transcript.trim().to_string(),
+            reason: "is-final",
+        }).await;
+    } else {
+        if transcript.trim().is_empty() {
+            return;
+        }
+        log::info!("[{}] partial={:?}", ts(), transcript);
+        let _ = event_tx.send(PipelineEvent::Partial {
+            track,
+            text: transcript.to_string(),
+        }).await;
+    }
 }
 
 fn i16_le_bytes(samples: &[i16]) -> Vec<u8> {
@@ -434,8 +384,8 @@ fn i16_le_bytes(samples: &[i16]) -> Vec<u8> {
 struct ResultsMsg {
     #[serde(default)]
     is_final: bool,
-    #[serde(default, rename = "speech_final")]
-    _speech_final: bool,
+    #[serde(default)]
+    speech_final: bool,
     channel: Channel,
 }
 
@@ -477,7 +427,7 @@ mod tests {
             "sample_rate=16000",
             "channels=1",
             "interim_results=true",
-            "endpointing=300",
+            "endpointing=200",
             "utterance_end_ms=1000",
             "smart_format=true",
             "punctuate=true",

@@ -18,7 +18,7 @@ use std::time::Duration;
 use audio_os::{capture_indefinite, CaptureTarget, PlaybackFormat, PlaybackTarget};
 use pipeline::{
     DeepgramClient, DeepgramConfig, DeepLClient, DeepLConfig, ElevenLabsConfig,
-    PipelineEvent, ResampleState, TrackId, TranscriptBufferConfig, TranslationContext,
+    PipelineEvent, ResampleState, TrackId, TranslationContext,
 };
 use tokio::sync::mpsc;
 
@@ -81,8 +81,6 @@ pub struct TrackConfig {
     // STT
     pub dg_api_key:  String,
     pub source_lang: Option<String>, // None = Deepgram auto-detect
-    pub buf_cfg:     TranscriptBufferConfig,
-
     // Translation (optional)
     pub deepl:       Option<DeeplTrackConfig>,
 
@@ -144,7 +142,6 @@ pub fn track_configs_from_app(
         source:      TrackSource::Mic(mic_node),
         dg_api_key:  cfg.dg_api_key.clone(),
         source_lang: cfg.source_lang.clone(),
-        buf_cfg:     cfg.buf.clone(),
         deepl:       make_deepl(t1_target_lang),
         tts:         tts_cfg,
     };
@@ -155,7 +152,6 @@ pub fn track_configs_from_app(
             source:      TrackSource::SinkMonitor(sink_node),
             dg_api_key:  cfg.dg_api_key.clone(),
             source_lang: cfg.source_lang.clone(),
-            buf_cfg:     cfg.buf.clone(),
             deepl:       make_deepl(t2_target_lang),
             tts:         None,
         })
@@ -204,8 +200,7 @@ async fn run_track(
         Some(lang) => DeepgramConfig::with_language(cfg.dg_api_key.clone(), lang),
         None       => DeepgramConfig::with_detect_language(cfg.dg_api_key.clone()),
     };
-    let (dg_handle, mut dg_events) =
-        DeepgramClient::spawn(dg_cfg, cfg.buf_cfg.clone(), track_id);
+    let (dg_handle, mut dg_events) = DeepgramClient::spawn(dg_cfg, track_id);
     let dg_handle = Arc::new(dg_handle);
 
     // ── DeepL ──────────────────────────────────────────────────────────────

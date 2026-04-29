@@ -28,7 +28,7 @@ impl Default for TranscriptBufferConfig {
         Self {
             min_chars_for_punct_flush: 30,
             max_chars_before_flush:    240,
-            silence_flush:             Duration::from_millis(1500),
+            silence_flush:             Duration::from_millis(500),
             flush_on_utterance_end:    true,
         }
     }
@@ -106,13 +106,13 @@ impl TranscriptBuffer {
         &self.last_partial
     }
 
-    /// Append a final segment. May trigger a flush if the resulting
-    /// buffer hits a punctuation/length threshold.
+    /// Append a final segment. Accumulates into buffer; flushes when the
+    /// buffer ends with sentence-terminal punctuation above min_chars, or
+    /// exceeds max_chars.
     pub fn on_final(&mut self, text: &str, now: Instant) -> Vec<BufferOutput> {
         if text.trim().is_empty() {
             return Vec::new();
         }
-        // Once a final arrives, the partial we were tracking is stale.
         self.last_partial.clear();
 
         if !self.buf.is_empty() && !self.buf.ends_with(' ') {
@@ -121,14 +121,23 @@ impl TranscriptBuffer {
         self.buf.push_str(text.trim());
         self.last_word_at = Some(now);
 
-        let mut out = vec![BufferOutput::Finalised { text: text.trim().to_string() }];
-
+        let mut out = Vec::new();
         if self.should_flush_on_punct() {
             out.push(self.take_flush(FlushReason::Punctuation));
         } else if self.buf.chars().count() >= self.cfg.max_chars_before_flush {
             out.push(self.take_flush(FlushReason::MaxChars));
         }
         out
+    }
+
+    fn should_flush_on_punct(&self) -> bool {
+        if self.buf.chars().count() < self.cfg.min_chars_for_punct_flush {
+            return false;
+        }
+        matches!(
+            self.buf.trim_end().chars().last(),
+            Some('.') | Some('?') | Some('!') | Some('…')
+        )
     }
 
     /// Hard end-of-speech signal from Deepgram.
@@ -164,23 +173,13 @@ impl TranscriptBuffer {
         }
     }
 
-    fn should_flush_on_punct(&self) -> bool {
-        if self.buf.chars().count() < self.cfg.min_chars_for_punct_flush {
-            return false;
-        }
-        // Look at the last non-whitespace character.
-        match self.buf.trim_end().chars().last() {
-            Some('.') | Some('?') | Some('!') | Some('…') => true,
-            _ => false,
-        }
-    }
-
     fn take_flush(&mut self, reason: FlushReason) -> BufferOutput {
         let text = std::mem::take(&mut self.buf);
         self.last_word_at = None;
         BufferOutput::Flushed { text, reason }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -204,11 +203,11 @@ mod tests {
     }
 
     #[test]
-    fn short_final_finalises_without_flush() {
+    fn short_final_stays_buffered() {
         let mut b = TranscriptBuffer::new(cfg());
-        let out = b.on_final("hi.", Instant::now()); // 3 chars, below min
-        assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], BufferOutput::Finalised { .. }));
+        // "hi." is 3 chars — below min_chars_for_punct_flush=10, stays in buf.
+        let out = b.on_final("hi.", Instant::now());
+        assert!(out.is_empty(), "short sentence should stay buffered, got {out:?}");
         assert_eq!(b.current(), "hi.");
     }
 
@@ -216,9 +215,8 @@ mod tests {
     fn punctuation_above_threshold_flushes() {
         let mut b = TranscriptBuffer::new(cfg());
         let out = b.on_final("hello there friend.", Instant::now());
-        // Two outputs: Finalised, then Flushed
-        assert_eq!(out.len(), 2);
-        match &out[1] {
+        assert_eq!(out.len(), 1);
+        match &out[0] {
             BufferOutput::Flushed { text, reason } => {
                 assert_eq!(text, "hello there friend.");
                 assert_eq!(*reason, FlushReason::Punctuation);
@@ -231,11 +229,11 @@ mod tests {
     #[test]
     fn finals_accumulate_across_pauses() {
         let mut b = TranscriptBuffer::new(cfg());
+        // Fragments accumulate in buffer until a punct-terminated chunk arrives.
         b.on_final("um", Instant::now());
         b.on_final("hello there", Instant::now());
         let out = b.on_final("friend.", Instant::now());
-        // The accumulated buffer is "um hello there friend." which is
-        // long enough to trigger a punctuation flush.
+        // "um hello there friend." — above min_chars, ends with punct → flush.
         assert!(out.iter().any(|o| matches!(
             o,
             BufferOutput::Flushed { reason: FlushReason::Punctuation, .. }
@@ -321,4 +319,5 @@ mod tests {
         b.on_final("real", Instant::now());
         assert_eq!(b.latest_partial(), "");
     }
+
 }
