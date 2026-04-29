@@ -109,7 +109,12 @@ impl TranslatorApp {
         if let Some(ref h) = self.session {
             h.stop();
         }
-        self.state.status = SessionStatus::Stopping;
+        self.state.status = SessionStatus::Idle;
+        self.state.mic_lines.clear();
+        self.state.audio_lines.clear();
+        self.state.mic_partial.clear();
+        self.state.audio_partial.clear();
+        self.state.errors.clear();
     }
 
     // ── Event drain ────────────────────────────────────────────────────────
@@ -176,7 +181,7 @@ impl eframe::App for TranslatorApp {
                 self.overlay_id,
                 ViewportBuilder::default()
                     .with_title("Translator Subtitles")
-                    .with_inner_size(Vec2::new(860.0, 160.0))
+                    .with_inner_size(Vec2::new(860.0, 260.0))
                     .with_always_on_top()
                     .with_decorations(true),
                 move |ctx, _| {
