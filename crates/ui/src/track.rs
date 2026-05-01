@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use audio_os::{capture_indefinite, CaptureTarget, PlaybackFormat, PlaybackTarget};
 use pipeline::{
@@ -33,6 +33,8 @@ use crate::transcript::{LogTrack, TranscriptLog};
 pub enum TrackEvent {
     /// Live in-flight transcript (not committed yet).
     Partial { track: TrackId, text: String },
+    /// Live in-flight transcript translated (throttled, may be stale).
+    PartialTranslated { track: TrackId, source: String, translated: String, seq: u64 },
     /// Flushed source text, translation pending.
     Flushed { track: TrackId, source: String },
     /// Translation arrived for a flushed chunk.
@@ -290,6 +292,62 @@ async fn run_track(
         log::info!("capture thread for track {:?} ended", track_id);
     });
 
+    // ── Partial translation task (completely isolated from is_final pipeline) ─
+    let (partial_tx, mut partial_rx) = mpsc::channel::<String>(16);
+    if let Some((dl, _, _)) = deepl_state.as_ref() {
+        let dl = dl.clone();
+        let tx = event_tx.clone();
+        let tid = track_id;
+        tokio::spawn(async move {
+            let mut last_tx = Instant::now() - Duration::from_secs(10); // allow immediate first
+            let mut seq = 0u64;
+            let mut current: Option<String> = None;
+            loop {
+                // Wait for new partial or a periodic 300 ms tick.
+                let recv = tokio::time::timeout(Duration::from_millis(300), partial_rx.recv()).await;
+                match recv {
+                    Ok(Some(text)) => current = Some(text),
+                    Ok(None) => break, // channel closed
+                    Err(_) => {}      // timer fired — attempt translation if we have text
+                }
+
+                let now = Instant::now();
+                if now.duration_since(last_tx) < Duration::from_millis(300) {
+                    continue;
+                }
+
+                if let Some(text) = current.take() {
+                    if text.trim().len() < 5 {
+                        continue;
+                    }
+                    last_tx = now;
+                    seq += 1;
+                    let dl = dl.clone();
+                    let tx = tx.clone();
+                    let t = text;
+                    let s = seq;
+                    // Fire the DeepL call in its own sub-task so the loop stays
+                    // responsive and can absorb newer partials while translating.
+                    tokio::spawn(async move {
+                        match dl.translate(&t, "").await {
+                            Ok(translated) => {
+                                let _ = tx.send(TrackEvent::PartialTranslated {
+                                    track: tid,
+                                    source: t,
+                                    translated,
+                                    seq: s,
+                                }).await;
+                            }
+                            Err(e) => {
+                                log::debug!("Partial translation failed (ignored): {e}");
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    }
+
     // ── Event + translation loop ───────────────────────────────────────────
     let mut deepl_state = deepl_state;
 
@@ -318,11 +376,13 @@ async fn run_track(
                     &event_tx,
                     &mut deepl_state,
                     &el_tx,
+                    &partial_tx,
                 ).await;
             }
         }
     }
 
+    drop(partial_tx); // signal partial task to shut down
     let _ = event_tx.send(TrackEvent::Ended { track: track_id }).await;
     drop(el_tx);
     log::info!("Track {:?}: runner exited", track_id);
@@ -337,11 +397,15 @@ async fn handle_pipeline_event(
     event_tx:     &mpsc::Sender<TrackEvent>,
     deepl_state:  &mut Option<(DeepLClient, String, TranslationContext)>,
     el_tx:        &Option<mpsc::Sender<String>>,
+    partial_tx:   &mpsc::Sender<String>,
 ) {
     match evt {
         PipelineEvent::Partial { text, .. } => {
             log.log_partial(log_track, &text);
-            let _ = event_tx.send(TrackEvent::Partial { track: track_id, text }).await;
+            let _ = event_tx.send(TrackEvent::Partial { track: track_id, text: text.clone() }).await;
+            // Forward to the isolated partial-translation task.  It decides
+            // when to actually call DeepL; we never block here.
+            let _ = partial_tx.try_send(text);
         }
 
         PipelineEvent::Finalised { .. } => {

@@ -97,6 +97,8 @@ impl TranslatorApp {
                 self.state.audio_lines.clear();
                 self.state.mic_partial.clear();
                 self.state.audio_partial.clear();
+                self.state.mic_partial_translated.clear();
+                self.state.audio_partial_translated.clear();
                 self.session = Some(handle);
             }
             Err(e) => {
@@ -114,6 +116,8 @@ impl TranslatorApp {
         self.state.audio_lines.clear();
         self.state.mic_partial.clear();
         self.state.audio_partial.clear();
+        self.state.mic_partial_translated.clear();
+        self.state.audio_partial_translated.clear();
         self.state.errors.clear();
     }
 
@@ -175,6 +179,7 @@ impl eframe::App for TranslatorApp {
         {
             let audio_lines   = self.state.audio_lines.clone();
             let audio_partial = self.state.audio_partial.clone();
+            let audio_partial_translated = self.state.audio_partial_translated.clone();
             let overlay_lines = self.state.overlay_lines;
 
             ctx.show_viewport_immediate(
@@ -185,7 +190,13 @@ impl eframe::App for TranslatorApp {
                     .with_always_on_top()
                     .with_decorations(true),
                 move |ctx, _| {
-                    draw_subtitle_overlay(ctx, &audio_lines, &audio_partial, overlay_lines);
+                    draw_subtitle_overlay(
+                        ctx,
+                        &audio_lines,
+                        &audio_partial_translated,
+                        &audio_partial,
+                        overlay_lines,
+                    );
                 },
             );
         }
@@ -415,9 +426,14 @@ fn draw_status(ui: &mut egui::Ui, state: &UiState) {
         ui.colored_label(Color32::from_rgb(220, 80, 80), format!("⚠ {e}"));
     }
 
-    if !state.mic_partial.is_empty() {
+    let partial_text = if !state.mic_partial_translated.is_empty() {
+        &state.mic_partial_translated
+    } else {
+        &state.mic_partial
+    };
+    if !partial_text.is_empty() {
         ui.label(
-            RichText::new(format!("🎤 …{}", state.mic_partial))
+            RichText::new(format!("🎤 …{partial_text}"))
                 .color(Color32::GRAY)
                 .italics()
                 .small(),
@@ -457,7 +473,8 @@ fn draw_mic_history(ui: &mut egui::Ui, state: &UiState) {
 fn draw_subtitle_overlay(
     ctx:          &Context,
     lines:        &[SubtitleLine],
-    partial:      &str,
+    partial_translated: &str,
+    partial_raw:  &str,
     overlay_lines: usize,
 ) {
     let bg = Color32::from_rgba_premultiplied(0, 0, 0, 210);
@@ -475,16 +492,23 @@ fn draw_subtitle_overlay(
                 ui.label(
                     RichText::new(&line.translated)
                         .color(Color32::from_rgba_premultiplied(255, 255, 255, alpha))
-                        .font(FontId::proportional(22.0))
+                        .font(FontId::proportional(16.0))
                         .strong(),
                 );
             }
 
-            if !partial.is_empty() {
+            if !partial_translated.is_empty() {
                 ui.label(
-                    RichText::new(format!("…{partial}"))
-                        .color(Color32::from_rgba_premultiplied(200, 200, 200, 160))
-                        .font(FontId::proportional(17.0))
+                    RichText::new(format!("…{partial_translated}"))
+                        .color(Color32::from_rgba_premultiplied(200, 200, 200, 180))
+                        .font(FontId::proportional(14.0))
+                        .italics(),
+                );
+            } else if !partial_raw.is_empty() {
+                ui.label(
+                    RichText::new(format!("…{partial_raw}"))
+                        .color(Color32::from_rgba_premultiplied(180, 180, 180, 140))
+                        .font(FontId::proportional(12.0))
                         .italics(),
                 );
             }

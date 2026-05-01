@@ -81,6 +81,7 @@ impl TranslationContext {
 }
 
 /// Async DeepL client. Reuse across calls — reqwest keeps the connection pool.
+#[derive(Clone)]
 pub struct DeepLClient {
     cfg:  DeepLConfig,
     http: reqwest::Client,

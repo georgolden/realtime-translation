@@ -113,6 +113,15 @@ pub struct UiState {
     /// Live partial from Track 2 (audio, not yet flushed).
     pub audio_partial: String,
 
+    /// Translated live partial from Track 1 (throttled, may be stale).
+    pub mic_partial_translated: String,
+    /// Translated live partial from Track 2 (throttled, may be stale).
+    pub audio_partial_translated: String,
+
+    /// Sequence counters for partial translations (latest-wins).
+    pub mic_partial_seq: u64,
+    pub audio_partial_seq: u64,
+
     /// Non-fatal error messages (most recent first).
     pub errors: Vec<String>,
 }
@@ -134,7 +143,7 @@ impl UiState {
             selected_sink_idx:   None,
             t1_target_lang_idx,
             t2_target_lang_idx,
-            overlay_lines:       3,
+            overlay_lines:       5,
             tts_sink_name:       cfg.tts_sink_name.clone().unwrap_or_default(),
             track2_enabled:      cfg.track2_enabled,
             context_sentences:  cfg.context_sentences,
@@ -151,6 +160,10 @@ impl UiState {
             audio_lines:        Vec::new(),
             mic_partial:        String::new(),
             audio_partial:      String::new(),
+            mic_partial_translated: String::new(),
+            audio_partial_translated: String::new(),
+            mic_partial_seq:    0,
+            audio_partial_seq:  0,
             errors:             Vec::new(),
         }
     }
@@ -186,10 +199,35 @@ impl UiState {
                 TrackId::Incoming => self.audio_partial = text,
             },
 
+            SessionEvent::PartialTranslated { track, source: _, translated, seq } => {
+                match track {
+                    TrackId::Outgoing => {
+                        if seq >= self.mic_partial_seq && !self.mic_partial.is_empty() {
+                            self.mic_partial_translated = translated;
+                            self.mic_partial_seq = seq;
+                        }
+                    }
+                    TrackId::Incoming => {
+                        if seq >= self.audio_partial_seq && !self.audio_partial.is_empty() {
+                            self.audio_partial_translated = translated;
+                            self.audio_partial_seq = seq;
+                        }
+                    }
+                }
+            }
+
             SessionEvent::Flushed { track, source: _ } => {
                 match track {
-                    TrackId::Outgoing => self.mic_partial.clear(),
-                    TrackId::Incoming => self.audio_partial.clear(),
+                    TrackId::Outgoing => {
+                        self.mic_partial.clear();
+                        self.mic_partial_translated.clear();
+                        self.mic_partial_seq = 0;
+                    }
+                    TrackId::Incoming => {
+                        self.audio_partial.clear();
+                        self.audio_partial_translated.clear();
+                        self.audio_partial_seq = 0;
+                    }
                 }
                 // Do not push a placeholder — only Translated events add subtitle lines.
             }
@@ -225,6 +263,10 @@ impl UiState {
                 }
                 self.mic_partial.clear();
                 self.audio_partial.clear();
+                self.mic_partial_translated.clear();
+                self.audio_partial_translated.clear();
+                self.mic_partial_seq = 0;
+                self.audio_partial_seq = 0;
             }
         }
     }
